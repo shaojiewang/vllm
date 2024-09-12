@@ -1,3 +1,4 @@
+import os
 import random
 from pathlib import Path
 
@@ -13,6 +14,8 @@ hipbsolidxgemm.hipb_create_extension()
 rtol = 1e-5
 atol = 1
 
+CACHE_INVALIDATE_BUFFERS = int(os.getenv("CACHE_INVALIDATE_BUFFERS", "37"))
+
 
 class Gemm:
 
@@ -24,7 +27,7 @@ class Gemm:
         self.outdtype = outdtype
         self.use_rocblas = (indtype == outdtype
                             and indtype is not torch.float8_e4m3fnuz)
-        self.nb = 37
+        self.nb = CACHE_INVALIDATE_BUFFERS
         self.inp = torch.randn((self.n, self.k),
                                device='cuda').to(self.indtype)
         self.weights = torch.randn((self.m, self.k),
@@ -62,15 +65,21 @@ class Gemm:
         self.hipb_sols = sols
 
     def check_gemm_ref(self, libtype, solidx):
-        ref = F.linear(self.inp.to(torch.float32),
-                       self.weights.to(torch.float32)).to(self.outdtype)
+        if self.indtype == torch.float8_e4m3fnuz:
+            ref, _ = torch._scaled_mm(self.inp,
+                                      self.weights.t(),
+                                      out_dtype=self.outdtype)
+        else:
+            ref = F.linear(self.inp, self.weights)
         if libtype == 'hipblaslt':
             c = hipbsolidxgemm.hipb_mm(self.inp, self.weights.t(), solidx,
                                        self.outdtype)
         elif libtype == 'rocblas':
             c = rocsolidxgemm.rocb_mm(self.inp, self.weights.t(), solidx)
-        if torch.allclose(c, ref, atol=self.atol, rtol=self.rtol):
-            #print('>>>',libtype,'Solidx',solidx,'passed reference test')
+        if torch.allclose(c.to(self.outdtype),
+                          ref.to(self.outdtype),
+                          atol=self.atol,
+                          rtol=self.rtol):
             return True
 
         print('>>>',
@@ -263,7 +272,8 @@ class GemmTuner:
 
     def find_best_sols(self):
         df = self.gemm_problems
-        soldf = pd.DataFrame()
+        soldf = pd.DataFrame(
+            columns=['libtype', 'solidx', 'soltimems', 'indtype', 'outdtype'])
         for i in range(len(df)):
             ds = df.loc[i, :]
             gemmobj = Gemm(ds['M'],
@@ -276,10 +286,14 @@ class GemmTuner:
             soldf.loc[i, 'libtype'] = gemmobj.best_libtype
             soldf.loc[i, 'solidx'] = gemmobj.best_solidx
             soldf.loc[i, 'soltimems'] = gemmobj.best_soltime
+            del gemmobj
+            torch.cuda.empty_cache()
+
         soldf['indtype'] = self.indtype
         soldf['outdtype'] = self.outdtype
         finaldf = pd.concat([self.gemm_problems, soldf], axis=1)
-        finaldf = pd.concat([finaldf, self.gdf])
-        finaldf['solidx'] = finaldf['solidx'].astype('int64')
+        if self.gdf is not None:
+            finaldf = pd.concat([finaldf, self.gdf])
+        finaldf['solidx'] = finaldf['solidx'].convert_dtypes('int64')
         finaldf.to_csv(self.tuned_file, index=False)
         print(finaldf)
